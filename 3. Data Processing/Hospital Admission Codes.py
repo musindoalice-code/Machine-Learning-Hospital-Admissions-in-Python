@@ -21,8 +21,18 @@
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC Loads the libraries :
+# MAGIC - pandas (tables),
+# MAGIC - NumPy (maths),
+# MAGIC - Matplotlib/Seaborn (charts),
+# MAGIC - SciPy (statistical tests),
+# MAGIC - scikit-learn (modelling)
+
+# COMMAND ----------
+
 # DBTITLE 1,Import library
-#Loads the libraries : pandas (tables), NumPy (maths),Matplotlib/Seaborn (charts), SciPy (statistical tests), scikit-learn (modelling)
+
 
 import pandas as pd, numpy as np
 import matplotlib.pyplot as plt, seaborn as sns
@@ -312,7 +322,7 @@ display(pd.DataFrame({"Count": counts, "Percentage": percentages}))
 # MAGIC %md
 # MAGIC **Observations — Gender distribution**
 # MAGIC
-# MAGIC * Female patients account for 1,555 admissions (51.83%) and Male patients for 1,445 (48.17%).
+# MAGIC * Male patients account for 1,555 admissions (51.83%) and Female patients for 1,445 (48.17%).
 # MAGIC * The split is nearly even, so Gender is balanced in the data and needs no rebalancing before modelling.
 
 # COMMAND ----------
@@ -1627,6 +1637,145 @@ display(pd.DataFrame(rows).round(3))
 # MAGIC * Constraining the tree shrinks the gap dramatically: the shallower tree (depth 3, leaf 50) cuts overfitting from 0.157 to 0.065, and aggressive pruning (ccp_alpha = 0.005) eliminates it entirely — but prunes the tree all the way down to a stump with CV AUC 0.500, i.e. no signal left at all.
 # MAGIC * The trade-off is explicit: regularisation removes memorised noise *and* the little real signal together. The current tuned tree keeps the best cross-validated AUC (0.522), but pays for it with a 0.16 train-vs-test gap.
 # MAGIC * With signal this weak, the mitigation choice is a judgement call: if trust and generalisation matter most, the shallower tree (CV 0.508, gap 0.065) is the more defensible final model — the marginal 0.014 of CV AUC the deeper tree buys is not worth its instability.
+
+# COMMAND ----------
+
+# DBTITLE 1,Data adequacy check — header
+# MAGIC %md
+# MAGIC ## Data Adequacy Check: Does Each Patient Appear Once, and Would More Rows Help?
+# MAGIC
+# MAGIC Two questions for the dataset itself:
+# MAGIC
+# MAGIC * Is every patient represented by exactly one row (no repeat visits that could leak information between the training and test sets)?
+# MAGIC * Do the recorded features carry any real signal about readmission — i.e. would collecting more rows with the same columns improve the models?
+
+# COMMAND ----------
+
+# DBTITLE 1,Check patient uniqueness and feature signal
+# Data adequacy check.
+# (1) Patient uniqueness: if the same Patient ID appeared in both the training and
+#     the test set, the models could "recognise" patients instead of learning patterns.
+# (2) Feature signal: point-biserial correlation (numeric features vs the Yes/No target)
+#     and chi-square tests (categorical features). A p-value below ~0.05 would mean a
+#     real relationship; nothing here reaches that bar.
+
+import pandas as pd
+from scipy import stats
+
+check_df = spark.table("workspace.default.patient_readmission_data_").toPandas()
+
+print("Rows:", len(check_df))
+print("Unique Patient IDs:", check_df["Patient ID"].nunique())
+print("Every patient appears exactly once:", check_df["Patient ID"].is_unique)
+print("Duplicate full rows:", check_df.duplicated().sum())
+
+y_check = (check_df["Readmission"] == "Yes").astype(int)
+print("\nReadmission rate (share of 'Yes'):", round(y_check.mean(), 3))
+
+rows = []
+for col in ["Age", "Length of Stay", "Number of Diagnoses",
+            "Blood Pressure", "Blood Sugar Levels", "Previous Admissions"]:
+    r, p = stats.pointbiserialr(y_check, check_df[col])
+    rows.append({"feature": col, "relationship to Readmission": round(r, 3),
+                 "p-value": round(p, 3)})
+for col in ["Gender", "Admission Type"]:
+    ct = pd.crosstab(check_df[col], y_check)
+    _, p, _, _ = stats.chi2_contingency(ct)
+    rows.append({"feature": col, "relationship to Readmission": "chi-square",
+                 "p-value": round(p, 3)})
+display(pd.DataFrame(rows))
+
+# COMMAND ----------
+
+# DBTITLE 1,Observations - Data adequacy check
+# MAGIC %md
+# MAGIC **Observations — Data adequacy check**
+# MAGIC
+# MAGIC * Every patient appears exactly once: 3,000 rows carry 3,000 unique Patient IDs, with 0 duplicated rows. There is no repeat-visit leakage between the training and test sets, so the weak results cannot be blamed on that.
+# MAGIC * No feature has a real relationship with readmission: every numeric correlation sits between -0.007 and +0.029, and no p-value comes close to the 0.05 significance bar (the closest is Age at 0.106; Gender 0.438 and Admission Type 0.555 are just as empty). Readmission behaves as if randomly assigned relative to these eight features.
+# MAGIC * The consequence for "would more rows help?": no. More rows drawn from the same eight columns would only push the models more firmly toward the ~0.50 coin-flip AUC they already sit at — more data cannot create signal that the columns do not contain. What would genuinely help is new columns: diagnosis codes, medications, lab results, and discharge information — the real-world drivers this dataset lacks.
+
+# COMMAND ----------
+
+# DBTITLE 1,Accuracy ceiling — header
+# MAGIC %md
+# MAGIC ## Accuracy Ceiling: Can Any Model Reach 80%?
+# MAGIC
+# MAGIC A natural follow-up to the data adequacy check: the models score in the 0.49–0.60 accuracy range — could better tuning push accuracy past 80%?
+# MAGIC
+# MAGIC This analysis gives every model its best possible shot: train the strongest candidates, sweep **every** decision threshold from 0.02 to 0.98, and keep the highest accuracy each one can achieve. If the best of all that equals the "always say No" baseline, the columns contain nothing a model can convert into extra accuracy.
+
+# COMMAND ----------
+
+# DBTITLE 1,Sweep every threshold for the best achievable accuracy
+# Accuracy ceiling analysis: can any model built from these columns reach 80%?
+# Self-contained (own imports, own data load) so it runs regardless of notebook state.
+
+import pandas as pd, numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
+
+ceil_df = spark.table("workspace.default.patient_readmission_data_").toPandas()
+ceil_df.columns = [c.replace(" ", "_") for c in ceil_df.columns]
+y_ceil = (ceil_df["Readmission"] == "Yes").astype(int)
+X_ceil = ceil_df.drop(columns=["Patient_ID", "Readmission"])
+
+Xtr_c, Xte_c, ytr_c, yte_c = train_test_split(
+    X_ceil, y_ceil, test_size=0.2, random_state=42, stratify=y_ceil
+)
+
+num_cols = ["Age", "Length_of_Stay", "Number_of_Diagnoses",
+            "Blood_Pressure", "Blood_Sugar_Levels", "Previous_Admissions"]
+cat_cols = ["Gender", "Admission_Type"]
+prep_c = ColumnTransformer([
+    ("num", StandardScaler(), num_cols),
+    ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols),
+])
+
+baseline_acc = (yte_c == 0).mean()
+thresholds = np.arange(0.02, 0.99, 0.02)
+
+models = {
+    "Tuned Decision Tree (depth 7, leaf 30)":
+        DecisionTreeClassifier(max_depth=7, min_samples_leaf=30, random_state=42),
+    "Random Forest (200 trees)":
+        RandomForestClassifier(n_estimators=200, random_state=42),
+}
+
+rows = [{"model": "Always predict 'No' (baseline)",
+         "best accuracy at ANY threshold": round(baseline_acc, 3)}]
+for name, clf in models.items():
+    pipe = Pipeline([("prep", prep_c), ("clf", clf)])
+    pipe.fit(Xtr_c, ytr_c)
+    proba = pipe.predict_proba(Xte_c)[:, 1]
+    best_t, best_acc = max(
+        ((t, accuracy_score(yte_c, (proba >= t).astype(int))) for t in thresholds),
+        key=lambda x: x[1]
+    )
+    rows.append({"model": name, "best accuracy at ANY threshold": round(best_acc, 3)})
+display(pd.DataFrame(rows))
+
+needed = int(0.8 * len(yte_c))
+already_right = int((yte_c == 0).sum())
+print(f"To reach 80% accuracy a model must get {needed} of {len(yte_c)} test patients right.")
+print(f"Always saying 'No' already gets {already_right} right (every non-readmission).")
+print(f"The extra {needed - already_right} must come from correctly flagging true readmissions,")
+print("which requires features that actually relate to readmission - these eight do not.")
+
+# COMMAND ----------
+
+# DBTITLE 1,Observations - Accuracy ceiling
+# MAGIC %md
+# MAGIC **Observations — Accuracy ceiling analysis**
+# MAGIC
+# MAGIC * The sweep gives every model its best possible shot: 49 decision thresholds from 0.02 to 0.98, keeping the highest accuracy. The result: the tuned Decision Tree tops out at 0.712 and the Random Forest at 0.712 — identical to the always-say-"No" baseline of 0.712 (427 of 600 test patients).
+# MAGIC * No model built from these eight columns can exceed ~71.2% accuracy, so 80% is out of reach. The arithmetic is unforgiving: 80% means 480 of 600 test patients correct, and 427 of those come free from the non-readmissions. The remaining 53 can only come from correctly flagging true readmissions — and the data adequacy check showed no feature carries that information.
+# MAGIC * Any report of 80%+ accuracy on this dataset would therefore signal a methodological error, not a good model: target leakage (the earlier draft's fake 100% came from including Readmission_Flag in X) or evaluating on training data (Random Forest: 0.782 on training vs 0.475 on test — memorisation, not prediction). The honest ceiling is simply the class balance: 71% No / 29% Yes.
 
 # COMMAND ----------
 
